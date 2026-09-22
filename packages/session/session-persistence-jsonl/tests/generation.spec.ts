@@ -1249,7 +1249,15 @@ describe('JSONL immutable generation publication', () => {
       await writeFile(request.sourcePath, source)
       if (kind === 'different') await writeFile(request.currentPath, line(header(SESSION_FORMAT_VERSION)) + line(event1))
       if (kind === 'malformed') await writeFile(request.currentPath, '{not-json}\n')
-      if (kind === 'symlink') await symlink(request.sourcePath, request.currentPath)
+      if (kind === 'symlink') {
+        if (process.platform === 'win32') {
+          const target = join(root, 'link-target')
+          await mkdir(target)
+          await symlink(target, request.currentPath, 'junction')
+        } else {
+          await symlink(request.sourcePath, request.currentPath)
+        }
+      }
       if (kind === 'directory') await mkdir(request.currentPath)
 
       await expect(ensureJsonlGenerationCurrent(request)).rejects.toBeInstanceOf(
