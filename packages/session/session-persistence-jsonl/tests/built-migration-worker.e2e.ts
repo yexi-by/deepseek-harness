@@ -45,9 +45,16 @@ describe.skipIf(!built)('built migration verifier (plain node)', () => {
           } })
           try {
             return await new Promise((resolve, reject) => {
-              worker.once('message', resolve)
+              let result
+              worker.once('message', value => { result = value })
               worker.once('error', reject)
-              worker.once('exit', code => reject(new Error('verifier exited before a result: ' + code)))
+              worker.once('exit', code => {
+                if (code !== 0 || result === undefined) {
+                  reject(new Error('verifier exited without a complete result: ' + code))
+                } else {
+                  resolve(result)
+                }
+              })
             })
           } finally {
             await worker.terminate()

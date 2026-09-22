@@ -42,12 +42,17 @@ const result = {
   digest: 'digest',
 }
 
+function succeed(instance = worker()): void {
+  instance.emit('message', { ok: true, result })
+  instance.emit('exit', 0)
+}
+
 afterEach(() => {
   state.workers.length = 0
 })
 
 describe('migration verifier Worker lifecycle', () => {
-  it('resolves only after terminating a successful Worker', async () => {
+  it('waits for natural Worker exit after receiving a successful result', async () => {
     const expectedPrefix = { bytes: 3, digest: 'a'.repeat(64) }
     const verification = verifyCurrentGenerationInWorker('/stage', 'none', 'session', 2, expectedPrefix)
     const instance = worker()
@@ -56,14 +61,20 @@ describe('migration verifier Worker lifecycle', () => {
       expectedPrefix,
     })
     instance.emit('message', { ok: true, result })
-
+    const settled = vi.fn()
+    void verification.then(settled)
+    await Promise.resolve()
+    expect(settled).not.toHaveBeenCalled()
+    expect(instance.terminate).not.toHaveBeenCalled()
+    instance.emit('exit', 0)
     await expect(verification).resolves.toEqual(result)
-    expect(instance.terminate).toHaveBeenCalledOnce()
+    expect(instance.terminate).not.toHaveBeenCalled()
   })
 
   it('reconstructs a Worker-reported error', async () => {
     const verification = verifyCurrentGenerationInWorker('/stage', 'zstd', 'session', 0)
     worker().emit('message', { ok: false, message: 'invalid stage', stack: 'worker stack' })
+    worker().emit('exit', 0)
 
     await expect(verification).rejects.toMatchObject({ message: 'invalid stage', stack: 'worker stack' })
   })
@@ -71,6 +82,7 @@ describe('migration verifier Worker lifecycle', () => {
   it('accepts an error response without a stack', async () => {
     const verification = verifyCurrentGenerationInWorker('/stage', 'none', 'session', 0)
     worker().emit('message', { ok: false, message: 'invalid stage' })
+    worker().emit('exit', 0)
     await expect(verification).rejects.toThrow('invalid stage')
   })
 
@@ -96,34 +108,33 @@ describe('migration verifier Worker lifecycle', () => {
     await expect(verification).rejects.toBeInstanceOf(AggregateError)
   })
 
-  it('rejects a successful result when termination fails', async () => {
+  it('rejects an abnormal exit after a successful result', async () => {
     const verification = verifyCurrentGenerationInWorker('/stage', 'none', 'session', 0)
     const instance = worker()
-    instance.terminate.mockRejectedValueOnce('terminate failed')
     instance.emit('message', { ok: true, result })
-
-    await expect(verification).rejects.toThrow('terminate failed')
+    instance.emit('exit', 7)
+    await expect(verification).rejects.toThrow('after reporting a result (code 7)')
+    expect(instance.terminate).not.toHaveBeenCalled()
   })
 
-  it('preserves an Error from successful-result termination', async () => {
+  it('preserves an Error reported while the Worker finishes cleanup', async () => {
     const verification = verifyCurrentGenerationInWorker('/stage', 'none', 'session', 0)
     const instance = worker()
-    instance.terminate.mockRejectedValueOnce(new Error('terminate failed'))
     instance.emit('message', { ok: true, result })
-
-    await expect(verification).rejects.toThrow('terminate failed')
+    instance.emit('error', new Error('cleanup failed'))
+    await expect(verification).rejects.toThrow('cleanup failed')
   })
 
   it('ignores terminal signals after a result settles', async () => {
     const verification = verifyCurrentGenerationInWorker('/stage', 'none', 'session', 0)
     const instance = worker()
-    instance.emit('message', { ok: true, result })
+    succeed(instance)
     instance.emit('error', new Error('late error'))
     instance.emit('exit', 1)
     instance.emit('message', null)
 
     await expect(verification).resolves.toEqual(result)
-    expect(instance.terminate).toHaveBeenCalledOnce()
+    expect(instance.terminate).not.toHaveBeenCalled()
   })
 
   it('starts at most two verification Workers concurrently', async () => {
@@ -133,11 +144,14 @@ describe('migration verifier Worker lifecycle', () => {
     expect(state.workers).toHaveLength(2)
 
     worker(0).emit('message', { ok: true, result })
+    await Promise.resolve()
+    expect(state.workers).toHaveLength(2)
+    worker(0).emit('exit', 0)
     await first
     await vi.waitFor(() => { expect(state.workers).toHaveLength(3) })
 
-    worker(1).emit('message', { ok: true, result })
-    worker(2).emit('message', { ok: true, result })
+    succeed(worker(1))
+    succeed(worker(2))
     await expect(Promise.all([second, third])).resolves.toEqual([result, result])
   })
 
@@ -146,29 +160,23 @@ describe('migration verifier Worker lifecycle', () => {
     const second = verifyCurrentGenerationInWorker('/second', 'none', 'session', 0)
     const third = verifyCurrentGenerationInWorker('/third', 'none', 'session', 0)
     let fourth: Promise<typeof result> | undefined
-    worker(0).terminate.mockReturnValueOnce({
-      then(onFulfilled: (value: number) => unknown) {
-        onFulfilled(0)
-        queueMicrotask(() => {
-          fourth = verifyCurrentGenerationInWorker('/fourth', 'none', 'session', 0)
-        })
-        return Promise.resolve()
-      },
-    } as unknown as Promise<number>)
+    void first.then(() => {
+      fourth = verifyCurrentGenerationInWorker('/fourth', 'none', 'session', 0)
+    })
 
-    worker(0).emit('message', { ok: true, result })
+    succeed(worker(0))
     await first
     await vi.waitFor(() => { expect(state.workers).toHaveLength(3) })
     expect(worker(2).options.workerData).toMatchObject({ path: '/third' })
 
-    worker(1).emit('message', { ok: true, result })
+    succeed(worker(1))
     await second
     await vi.waitFor(() => { expect(state.workers).toHaveLength(4) })
     expect(worker(3).options.workerData).toMatchObject({ path: '/fourth' })
     if (fourth === undefined) throw new Error('fourth verification was not scheduled')
 
-    worker(2).emit('message', { ok: true, result })
-    worker(3).emit('message', { ok: true, result })
+    succeed(worker(2))
+    succeed(worker(3))
     await expect(Promise.all([third, fourth])).resolves.toEqual([result, result])
   })
 
@@ -185,8 +193,8 @@ describe('migration verifier Worker lifecycle', () => {
     await expect(queued).rejects.toBe(reason)
     expect(state.workers).toHaveLength(2)
 
-    worker(0).emit('message', { ok: true, result })
-    worker(1).emit('message', { ok: true, result })
+    succeed(worker(0))
+    succeed(worker(1))
     await expect(Promise.all([first, second])).resolves.toEqual([result, result])
     expect(state.workers).toHaveLength(2)
   })

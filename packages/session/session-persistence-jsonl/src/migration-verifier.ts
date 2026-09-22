@@ -96,7 +96,8 @@ function workerSpawn(request: VerificationRequest): { readonly entry: string | U
 }
 
 /**
- * Verify one current generation in a fresh Worker Thread.
+ * Verify one current generation in a fresh Worker Thread and await its exit.
+ * Reported outcomes settle after normal cleanup; cancellation terminates and awaits the Worker.
  * @param path - staged or competing current-generation path.
  * @param compression - configured physical encoding.
  * @param expectedId - Session id expected in the decoded header.
@@ -140,6 +141,7 @@ function runVerificationWorker(
   const worker = new Worker(entry, options)
   return new Promise((resolve, reject) => {
     let settled = false
+    let response: VerificationResponse | undefined
     const cleanup = (): void => {
       signal?.removeEventListener('abort', abort)
     }
@@ -157,28 +159,30 @@ function runVerificationWorker(
     }
     worker.once('message', (value: unknown) => {
       /* v8 ignore next -- a duplicate message races only after another terminal callback settled. */
-      if (settled) return
+      if (settled || response !== undefined) return
       if (typeof value !== 'object' || value === null || typeof (value as { ok?: unknown }).ok !== 'boolean') {
         fail(new Error('migration verifier returned an invalid response'))
         return
       }
-      const response = value as VerificationResponse
-      if (!response.ok) {
-        const error = new Error(response.message)
-        if (response.stack !== undefined) error.stack = response.stack
-        fail(error)
-        return
-      }
-      settled = true
+      response = value as VerificationResponse
       cleanup()
-      void worker.terminate().then(
-        () => { resolve(response.result) },
-        (error: unknown) => { reject(error instanceof Error ? error : new Error(String(error))) },
-      )
     })
     worker.once('error', fail)
     worker.once('exit', (code) => {
-      if (!settled) fail(new Error(`migration verifier exited before reporting a result (code ${code})`))
+      if (settled) return
+      settled = true
+      cleanup()
+      if (response === undefined) {
+        reject(new Error(`migration verifier exited before reporting a result (code ${code})`))
+      } else if (code !== 0) {
+        reject(new Error(`migration verifier exited after reporting a result (code ${code})`))
+      } else if (response.ok) {
+        resolve(response.result)
+      } else {
+        const error = new Error(response.message)
+        if (response.stack !== undefined) error.stack = response.stack
+        reject(error)
+      }
     })
     const abort = (): void => { fail(verifierAbortError(signal)) }
     signal?.addEventListener('abort', abort, { once: true })
