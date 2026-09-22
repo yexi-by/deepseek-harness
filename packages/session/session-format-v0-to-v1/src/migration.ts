@@ -91,7 +91,9 @@ function normalizeReleasedV0Event(
   assertSupportedLegacyType(named, sessionId)
   const start = normalizeLegacyTurnStart(named, sessionId)
   const end = normalizeLegacyTurnEnd(start, sessionId)
-  const header = normalizeLegacyRequestHeader(end, sessionId)
+  const permission = normalizeLegacyPermissionPreset(end)
+  const descriptor = normalizeLegacySubagentDescriptor(permission)
+  const header = normalizeLegacyRequestHeader(descriptor, sessionId)
   const steering = normalizeLegacySteering(header, sessionId)
   const retry = normalizeLegacyRetry(steering, sessionId, state.retryIds)
   const compaction = normalizeLegacyCompaction(retry, sessionId, state)
@@ -100,6 +102,28 @@ function normalizeReleasedV0Event(
   const messageId = eventMessageId(message)
   if (messageId !== undefined) state.messageIds.set(message.seq, messageId)
   return message
+}
+
+/** 保留权限预设，移除已退役的来源标记。 */
+function normalizeLegacyPermissionPreset(event: SessionFormatEvent): SessionFormatEvent {
+  if (event.type !== 'permission/preset') return event
+  const data = releasedV0Record(event.data, `permission/preset ${event.seq} data`)
+  if (!Object.hasOwn(data, 'origin')) return event
+  assertReleasedV0Keys(data, ['preset', 'origin'], [], `permission/preset ${event.seq} data`)
+  if (data['origin'] !== 'default' && data['origin'] !== 'selection' && data['origin'] !== 'inferred') {
+    throw new SessionFormatError(`permission/preset ${event.seq} origin is not a released value`)
+  }
+  return { ...event, data: { preset: data['preset'] as SessionFormatJsonValue } }
+}
+
+/** V3 仅新增可选推理等级；V2 组合字段保持原值且不推断等级。 */
+function normalizeLegacySubagentDescriptor(event: SessionFormatEvent): SessionFormatEvent {
+  if (event.type !== 'subagent/descriptor') return event
+  const data = releasedV0Record(event.data, `subagent/descriptor ${event.seq} data`)
+  if (data['version'] !== 2) return event
+  assertReleasedV0Keys(data, ['version', 'mode', 'provider'],
+    ['label', 'agentProvider', 'agentModel', 'persona', 'toolFilter'], `subagent/descriptor ${event.seq} data`)
+  return { ...event, data: { ...data, version: 3 } }
 }
 
 function normalizeLegacyCompactionType(event: SessionFormatEvent): SessionFormatEvent {

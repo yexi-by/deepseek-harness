@@ -20,7 +20,7 @@ afterEach(async () => {
 })
 
 describe.each(['none', 'zstd'] as const)('historical catalog publication (%s)', (compression) => {
-  async function fixture() {
+  async function fixture(initialVersion = 3) {
     const root = await mkdtemp(join(tmpdir(), 'dsh-catalog-migration-'))
     roots.push(root)
     const ctx = new Context()
@@ -39,7 +39,7 @@ describe.each(['none', 'zstd'] as const)('historical catalog publication (%s)', 
         : Buffer.concat([await compressZstdFrame(first), ...(body.length === 0 ? [] : [await compressZstdFrame(body)])]))
       return path
     }
-    await write(parent, [])
+    await write(parent, [], false, initialVersion)
     const descriptor = { type: 'subagent/descriptor', seq: 0, time: 2, data: { version: 3, mode: 'continuable', provider: 'spawn', label: 'old child' } }
     async function read() {
       const handle = await ctx.sessionPersistence.open(parent, 'read')
@@ -47,6 +47,31 @@ describe.each(['none', 'zstd'] as const)('historical catalog publication (%s)', 
     }
     return { root, ctx, parent, header, descriptor, write, read }
   }
+
+  it('publishes released permission origins and v2 child descriptors beside unchanged sources', async () => {
+    const f = await fixture(0)
+    const parentPath = await f.write(f.parent, [
+      { type: 'permission/preset', seq: 0, time: 1, data: { preset: 'workspace-write', origin: 'default' } },
+    ], false, 0)
+    const childPath = await f.write('child', [
+      { ...f.descriptor, data: { ...f.descriptor.data, version: 2 } },
+    ], true, 0)
+    const before = await Promise.all([readFile(parentPath), readFile(childPath)])
+    for (const id of [f.parent, SessionId('child')]) {
+      const handle = await f.ctx.sessionPersistence.open(id, 'write')
+      try {
+        const current = await handle.read()
+        expect(handle.header.version).toBe(4)
+        if (id === f.parent) {
+          expect(current.events.find(event => event.type === 'permission/preset')?.data)
+            .toEqual({ preset: 'workspace-write' })
+        } else {
+          expect(current.events.find(event => event.type === 'subagent/descriptor')?.data).toEqual(f.descriptor.data)
+        }
+      } finally { await handle.close() }
+    }
+    expect(await Promise.all([readFile(parentPath), readFile(childPath)])).toEqual(before)
+  })
 
   it.each(['read', 'write'] as const)('refuses foreign native V4 delivery through %s access', async (access) => {
     const f = await fixture()

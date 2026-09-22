@@ -30,6 +30,44 @@ function createMigrationStage(id: string) {
 }
 
 describe('released Session format v0 to v1', () => {
+  it.each(['default', 'selection', 'inferred'])('restores a permission selection with retired %s origin', (origin) => {
+    const source = Object.freeze({
+      type: 'permission/preset', seq: 0, time: 1,
+      data: Object.freeze({ preset: 'workspace-write', origin }),
+    })
+    expect(createMigrationStage('permission-origin').transform(source)).toEqual([
+      { ...source, data: { preset: 'workspace-write' } },
+    ])
+    expect(source.data.origin).toBe(origin)
+  })
+
+  it('rejects an unknown permission origin and unrelated payload members', () => {
+    const transform = (data: Record<string, string>) => createMigrationStage('permission-origin').transform({
+      type: 'permission/preset', seq: 0, time: 1, data,
+    })
+    expect(() => transform({ preset: 'workspace-write', origin: 'unknown' })).toThrow(/origin/)
+    expect(() => transform({ preset: 'workspace-write', origin: 'default', extra: 'value' })).toThrow(/extra/)
+  })
+
+  it.each(['one-shot', 'continuable'])('promotes a v2 %s subagent descriptor without changing its composition', (mode) => {
+    const data = Object.freeze({
+      version: 2, mode, provider: 'spawn', label: 'child',
+      ...(mode === 'continuable' ? { agentProvider: 'provider', agentModel: 'model', persona: 'persona', toolFilter: { allow: ['read'] } } : {}),
+    })
+    const source = { type: 'subagent/descriptor', seq: 0, time: 1, data }
+    expect(createMigrationStage('descriptor-v2').transform(source)).toEqual([
+      { ...source, data: { ...data, version: 3 } },
+    ])
+    expect(data.version).toBe(2)
+  })
+
+  it('rejects fields unavailable in a v2 subagent descriptor', () => {
+    expect(() => createMigrationStage('descriptor-v2').transform({
+      type: 'subagent/descriptor', seq: 0, time: 1,
+      data: { version: 2, mode: 'continuable', provider: 'spawn', label: 'child', agentReasoningEffort: 'high' },
+    })).toThrow(/agentReasoningEffort/)
+  })
+
   it('changes only the version of a canonical decoded artifact', () => {
     const header = {
       type: 'session',
